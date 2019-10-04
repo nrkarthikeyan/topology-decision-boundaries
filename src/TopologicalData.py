@@ -9,24 +9,21 @@ import matplotlib.pyplot as plt
 import matplotlib.collections  as mc
 from scipy.io import savemat
 from sklearn.metrics.pairwise import pairwise_distances
-from ripser_interface import ripser
 from supVR import compute_C_first, update_P, init_C_inds, compute_C_closest
 from logging import warn
 from time import time
 from common_utils import create_dir_if_not_exist
-from exceptions import ValueError
 
 class TopologicalData:
 
     def __init__(self, x, y, graphtype, scale, k = None, showComplexes = False,
-                 saveComplexes = True, use_cy = False, N = None, exptid = "0",
-                 PH_program = "ripser", maxdim = 1, njobs = 28, 
-                 dipha_path = "../dipha/build/dipha",
-                 ripser_path = '../ripser/ripser'):
+                 saveComplexes = True, use_cy = False, 
+                 N = None, maxdim = 1, njobs = 1,
+                 resultsdir = "results", exptid = "0",
+                 PH_program = "ripser"):
         """
         dims - 0 (simply connected components), 1 (1-dimensional holes)
         """
-        
         assert(graphtype)
         
         self.graphtype = graphtype
@@ -40,23 +37,31 @@ class TopologicalData:
         self.exptid = exptid
         self.PH_program = PH_program
         self.njobs = njobs
-        self.dipha_path = dipha_path
-        self.ripser_path = ripser_path
         self.bc = None
 
-        # Intermediate files dir
-        create_dir_if_not_exist("intermediate")
+        allowed_graphtypes = ["beta", "knn", "knn_rho", "eps"]
+        if graphtype not in allowed_graphtypes:
+            ValueError("Graph type is not in one of allowed types: " + str(allowed_graphtypes))
 
+        allowed_PH_programs = ["ripser"]
+        if self.PH_program not in allowed_PH_programs:
+            ValueError("PH program is not in one of allowed programs: " + str(allowed_PH_programs))
+        
         # results dir
-        create_dir_if_not_exist("results")
-        create_dir_if_not_exist(os.path.join("results", 
+        create_dir_if_not_exist(resultsdir)
+        create_dir_if_not_exist(os.path.join(resultsdir, 
                                 "expt_"+str(self.exptid)))
         
         if graphtype == "beta":
-            self.ngl_exec = "../ngl/src/compute-neighborhood"
+            if N is None:
+                warn("N is not specified, defaulting to 1/10 of number of examples")
+                N = int(x.shape[0]*0.1)
+            else:
+                N = np.minimum(N, x.shape[0])
             self.P, self.nTriv, self.numFilt =\
-                self.beta_opposing_simplex(x, y, scale)
+                self.beta_opposing_simplex(x, y, scale, N)
             self.beta = scale
+
         elif graphtype == "knn":
             if not use_cy:
                 self.P, self.nTriv, self.numFilt =\
@@ -296,14 +301,8 @@ class TopologicalData:
 
             C[mask_mat] = 0.0
 
-            # for i in range(x.shape[0]):
-            #     same_inds = (y == y[i])
-            #     C[i, same_inds] = 0.0
-            #     C[same_inds, i] = 0.0
-
             # Set diagonals to 1
             np.fill_diagonal(C, 1.0)
-            # np.dot(C, C, out = C1)
             np.dot(C, C.transpose(), out = C1)
 
             np.greater(C1, 0.0, out = C1bool)
@@ -358,8 +357,6 @@ class TopologicalData:
         # Compute opposing neighbors
         S, DN = self.opposing_neighbors(x, y, N)
 
-        # Sigma array
-        #sigarr = np.sqrt(DN[:,k-1].ravel())
         sigarr = np.ones(m)
         
         # Other inits
@@ -368,8 +365,8 @@ class TopologicalData:
         P = np.zeros((m,m), dtype = np.int32)
         inds = np.zeros(m, dtype = np.int32)
 
-        #t1 = time()
         for j, r in enumerate(rho):
+
             # Re-initialize some arrays
             if j > 0:
                 C.fill(-1)
@@ -384,7 +381,6 @@ class TopologicalData:
             np.add(P, Pupd, out = P)
 
             nTriv[j] = np.sum(inds == 1)
-            #sum(np.sum(C, axis = 0) == 1)
 
             if self.showComplexes:
                 f = plt.figure(num = 1000, figsize = (rows*5, cols*5))
@@ -553,61 +549,52 @@ class TopologicalData:
         P = numFilt - P
 
         return P, nTriv, numFilt, C
-
-    def beta_skeleton_graph(self, ptcld, beta):
-        
+ 
+    def beta_skeleton_graph(self, ptcld, beta, N=None):
         """ Construct a beta skeleton graph for a point cloud and return the adjacency matrix
-            ngl_exec - Full path of the executable compute-neighborhood of the ngl package
-            (can be obtained from https://github.com/dhrieman/ngl)
+        Inputs:
             ptcld - numpy 2D array with each row corresponding to a point
             beta - beta value in the beta skeleton graph
-        """
-    
-        import random
-        import string
-        import subprocess as sbp
-        import os
-        from scipy.sparse import coo_matrix, diags
+            N - maximum number of neighbors for each node in the graph
+        Returns:
+            adj: A dense adjacency matrix
+        """    
+        import nglpy
+        import numpy as np
+        from scipy.sparse import csr_matrix, coo_matrix
+        from itertools import product, chain
 
         n = ptcld.shape[0]
-        fdim = ptcld.shape[1]
+        if N == None:
+            N = n
 
-        # Save the point cloud in a file
-        fname = ''.join(random.choice(string.ascii_uppercase) for _ in range(10))
-        fname = "intermediate/"+fname+".npy"
-        np.savetxt(fname, ptcld)
+        graph_type = 'beta skeleton'
+        aGraph = nglpy.Graph(ptcld, graph_type, int(N), float(beta))
 
-        # Call the beta skeleton code
-        p = sbp.Popen([self.ngl_exec, fname, str(fdim), "BSkeleton", str(beta)],
-                      stdout=sbp.PIPE, stderr=sbp.PIPE)
-        output = p.communicate()
+        neigh = aGraph.neighbors()
+        nzcoords = np.array(list(chain(*[list(product([k], v)) for k, v in neigh.items()])))
+        nnz = nzcoords.shape[0]
+        adj = coo_matrix((np.ones(nnz), 
+                            (nzcoords[:,0].ravel(), nzcoords[:,1].ravel())),
+                    shape=(n,n)).todense().A
+        assert((adj == adj.transpose()).all())
 
-        # Remove the data file
-        if os.path.isfile(fname):
-            os.remove(fname)
+        beta_graph = {'adj': adj}
 
-        if p.returncode != 0:
-            raise Exception("Error with neighborhood graph computation (C++) - " + str(output[1]))
-        else:
-            edges = np.array([map(int, l.split(" ")) for l in output[0].strip().split("\n")])
-            adj = coo_matrix((1.0*np.ones(edges.shape[0]), (edges[:,0], edges[:,1])), shape = (n, n)).todense().A
-        
-        self.beta_graph = {'edges': edges, 'adj': adj}
-        
-        return edges, adj
-    
+        return adj
+
     def get_beta_graph(self):
         
         return self.beta_graph['adj']
     
     
-    def beta_skeleton_graph_2classes(self, x, y, beta):
+    def beta_skeleton_graph_2classes(self, x, y, beta, N=None):
         
         """Similar to the function beta_skeleton_graph except that only neighbors in
             opposing classes are connected (as given by y)"""
 
         # First obtain a unsupervised beta skeleton graph
-        edges, C = self.beta_skeleton_graph(x, beta)
+        C = self.beta_skeleton_graph(x, beta, N)
 
         # Mask specifying Trues for blocks where row and column have
         # same labels
@@ -625,7 +612,7 @@ class TopologicalData:
         
         return C
     
-    def beta_opposing_simplex(self, x, y, beta):
+    def beta_opposing_simplex(self, x, y, beta, N=None):
         
         """ 
         nearest neighbors from opposing classes with local scale computed
@@ -645,7 +632,7 @@ class TopologicalData:
 
         for j, b in enumerate(beta):
             
-            C = self.beta_skeleton_graph_2classes(x, y, b)
+            C = self.beta_skeleton_graph_2classes(x, y, b, N)
             #C = np.double(np.dot(C, C) > 0)
             np.dot(C, C.transpose(), out = C1)
 
@@ -722,87 +709,8 @@ class TopologicalData:
                     self.graphtype + "_complexes_" + str(i) + ".png"))
         return 1
 
-    def save_distance_matrix(self, distance_matrix, filename):
-        """ Saves distance matrix in the DIPHA format with the given
-            filename
-        """
 
-        import numpy as np
-
-        import subprocess
-        import os
-        import sys
-
-        filename = os.path.abspath(filename)
-        subprocess.call(["rm", filename])
-
-        fid = open(filename, "wb")
-        fid.write(np.array(8067171840).astype(np.int64))
-        fid.write(np.array(7).astype(np.int64))
-        fid.write(np.array(np.shape(distance_matrix)[1]).astype(np.int64))
-        fid.write(distance_matrix.reshape(-1).astype(np.float64))
-        # for i in range(np.shape(distance_matrix)[0]):
-        #     for j in range(np.shape(distance_matrix)[1]):
-        #         fid.write(np.array(distance_matrix[i, j]).astype(np.float64))
-        fid.close()
-
-    def load_persistence_diagram(self, fname, top_dim = None):
-
-        import struct
-        import numpy as np
-
-        with open(fname, "rb") as f:
-
-            assert struct.unpack('<q', f.read(8))[0] == 8067171840
-            assert struct.unpack('<q', f.read(8))[0] == 2
-
-            N = struct.unpack('<q', f.read(8))[0]
-
-            dims = []
-            birth_times = []
-            death_times = []
-
-            for i in range(0, N):
-                (d, birth, death) = struct.unpack('<qdd', f.read(3*8))
-                dims.append(d)
-                birth_times.append(2 * birth)
-                death_times.append(2 * death)
-
-        return np.array(dims), np.array(birth_times), np.array(death_times)
-
-
-    def dipha(self, dm, pdname, maxdim = 2):
-        """
-        # Homology dims start from 1 in this program
-        # 1 - number of simply connected components
-        # 2 - number of holes
-        """
-
-        import subprocess
-        import os
-        import sys
-        import numpy as np
-
-        dipha_path = os.path.abspath(self.dipha_path)
-        distmat = os.path.abspath(dm)
-        persdiag = os.path.abspath(pdname)
-
-        print("Using program dipha to compute persistence diagrams")
-        assert subprocess.call(["mpiexec", "-n", str(self.njobs), dipha_path, 
-                                "--upper_dim", str(maxdim),  distmat, 
-                                persdiag]) == 0
-        # "--dual",
-
-        dims, birth_values, death_values = self.load_persistence_diagram(pdname)
-
-        death_values[dims < 0] = np.inf
-        dims[dims < 0] = 0
-
-        self.dims = dims
-        self.birth_values = birth_values
-        self.death_values = death_values
-
-    def plotDiagram(self, pdname, dim, ax):
+    def plotDiagram(self, dim, ax):
 
         displayPers(self.birth_values[self.dims == dim], \
                          self.death_values[self.dims == dim], 
@@ -812,30 +720,25 @@ class TopologicalData:
 
         import matplotlib.pyplot as plt
         import numpy as np
-        import pandas as pd
 
-        import subprocess
+        # import subprocess
         import os
         import sys
+        import ripser
 
-        dmname = os.path.abspath('intermediate/temp_distance_matrix')
-        pdname = os.path.abspath('intermediate/temp_persdiag')
+        print("Using ripser for computing PH")
 
-        subprocess.call(["rm", dmname])
-        subprocess.call(["rm", pdname])
+        if self.PH_program == "ripser":
+            rips = ripser.ripser(self.P, maxdim=self.maxdim, 
+                                 distance_matrix=True,
+                                 do_cocycles=True)
+            dgm_dims = [dgm.shape[0] for dgm in rips['dgms']]
+            self.dims = np.hstack([idx*np.ones(i) 
+                                   for idx, i in enumerate(dgm_dims)])
+            dgms = np.vstack(rips['dgms'])
+            self.birth_values = dgms[:,0].ravel()
+            self.death_values = dgms[:,1].ravel()
 
-        print(np.max(self.P), np.min(self.P))
-
-        self.save_distance_matrix(self.P, dmname)
-        # Switch out dipha for ripser
-
-        if self.PH_program == "dipha":
-            self.dipha(dmname, pdname, maxdim = self.maxdim+1)
-        elif self.PH_program == "ripser":
-            self.dims, self.birth_values, self.death_values =\
-                        ripser(dmname, pdname, 
-                               maxdim = self.maxdim,
-                               ripser_path = self.ripser_path)
         else:
             raise Exception("Unknown persistent homology program")
         
@@ -843,9 +746,9 @@ class TopologicalData:
         ncc, self.nTriv, _ = multi_conn_comp(self.P, self.numFilt)
      
         filtValues = np.linspace(0, self.numFilt, self.numFilt)
-        self.bc = {d: None for d in pd.unique(self.dims)}
+        self.bc = {d: None for d in np.unique(self.dims)}
 
-        for dim in pd.unique(self.dims):
+        for dim in np.unique(self.dims):
             print("dimension %d" % (dim))
 
             if dim == 0:
@@ -854,11 +757,10 @@ class TopologicalData:
                 self.bc[dim] = bettiCounts(self.dims, self.birth_values, 
                                  self.death_values, filtValues, dim)
 
-            #fig = plt.figure(num = dim + 1, figsize = (20, 4))
             fig = plt.figure(num = np.random.randint(1000000), 
                              figsize = (20, 4))
             ax1 = fig.add_subplot(131)
-            self.plotDiagram(pdname, dim, ax1)
+            self.plotDiagram(dim, ax1)
 
             ax2 = fig.add_subplot(132)
             ax2.plot(self.scale, self.bc[dim])
@@ -870,7 +772,7 @@ class TopologicalData:
 
                 temp = np.array(self.bc[dim] - self.nTriv)
                 if len(temp[temp < 0]) > 0:
-                    print "Pick a bigger scale parameter."
+                    print("Pick a bigger scale parameter.")
 
                 ax3 = fig.add_subplot(133)
                 ax3.plot(self.scale, self.bc[dim] - self.nTriv)
@@ -891,7 +793,7 @@ class TopologicalData:
                     "birth": self.birth_values, "death": self.death_values,
                     "numFilt": self.numFilt, "nTriv": self.nTriv,
                     "filtValues": filtValues, "scale": self.scale}
-        for dim in pd.unique(self.dims):
+        for dim in np.unique(self.dims):
             out_dict["bc_"+str(int(dim))] = self.bc[dim]
 
         savemat(os.path.join("results", 
@@ -956,126 +858,6 @@ class TopologicalData:
             B[i, opp_ind[neigh_inds]] = 1.0
 
         return B, D
-
-    def localscale_neighbors_opposing_r_old(self, x, y, k, rho):
-        
-        """ 
-        nearest neighbors from opposing classes with local scale computed
-        based on D and B
-        (class other than that of the example considered)
-        Older version of the code that is slightly slower than the current
-        version.
-        This cannot be speeded up much since the bottleneck is in np.dot
-        of two big matrices to obtain the triangles. May be a more intelligent
-        algorithm to obtain 2 hop neighbors may help
-        """
-
-        P = np.zeros(x.shape[0])
-        numFilt = len(rho)
-        nTriv = np.zeros(numFilt)
-
-        rows = np.ceil(float(numFilt)/5)
-        cols = 5
-        f = plt.figure(num = 1000, figsize = (rows*5, cols*5))
-        
-        B, D = self.k_neighbors_opposing(x, y, k)
-
-        for j, r in enumerate(rho):
-
-            # Sigma array
-            sigarr = np.reshape(np.max(np.multiply(D, B), axis = 1), (-1,1))
-            sigmat = np.dot(np.sqrt(sigarr), np.sqrt(sigarr.T)) #####
-
-            # Neighbors with local scale
-            C = (D <= r * sigmat).astype(float)
-
-            for i in range(x.shape[0]):
-                same_inds = (y == y[i])
-                C[i, same_inds] = 0.0
-                C[same_inds, i] = 0.0
-
-            # Set diagonals to 1
-            np.fill_diagonal(C, 1.0)
-            C = np.double(np.dot(C, C) > 0)
-            P = P + C
-            nTriv[j] = sum(np.sum(C, axis = 0) == 1)
-
-            if self.showComplexes:
-                titl = "r = " + str(r)
-                self.show_simplicial_complex(x, y, C, f, rows, cols, j+1, titl)
-
-        P = numFilt - P
-
-        return P, nTriv, numFilt
-
-    def localscale_neighbors_opposing_r_x_old(self, x, y, k, N, rho):
-        
-        """ 
-        nearest neighbors from opposing classes with local scale computed
-        based on D and B
-        (class other than that of the example considered)
-
-        x - data points
-        y - class membership
-        k - nearest neighbors to be considered from opposing class for 
-            computing local scale
-        rho - List of multipliers to be used when computing the graph with
-            local scale. For a value r from this, an edge will be created when
-            d(x_i, x_j) < r*local_scale_i*local_scale_j and i, j belong to
-            opposing classes
-        N - max number of nearest neighbors from opposing classes (user parameter)
-        
-        2 hop neighbors are then computed to complete the triangles and form
-        simplices
-
-        SAME as localscale_neighbors_opposing_r but uses Cython for speedup
-        """
-    
-        numFilt = len(rho)
-        nTriv = np.zeros(numFilt)
-        m = x.shape[0]
-
-        rows = np.ceil(float(numFilt)/5)
-        cols = 5
-        f = plt.figure(num = 1000, figsize = (rows*5, cols*5))
-        
-        B, D = self.k_neighbors_opposing(x, y, k)
-
-        # Sigma array
-        sigarr = np.sqrt(np.max(np.multiply(D, B), axis = 1))
-        
-        # Other inits
-        C = -1*np.ones((m,N), dtype = np.int32)
-        Pupd = np.zeros((m,m), dtype = np.int32)
-        P = np.zeros((m,m), dtype = np.int32)
-        inds = np.zeros(m, dtype = np.int32)
-
-        for j, r in enumerate(rho):
-            # Re-initialize some arrays
-            if j > 0:
-                C.fill(-1)
-                inds.fill(0)
-                Pupd.fill(0)
-            
-            # Call Cython functions for updating P
-            init_C_inds(C, inds)
-            compute_C(C, inds, D, r, sigarr, y)
-            update_P(C, inds, Pupd, 1)
-            np.maximum(Pupd, Pupd.transpose(), out = Pupd)
-            np.add(P, Pupd, out = P)
-
-            nTriv[j] = np.sum(inds == 1)
-            #sum(np.sum(C, axis = 0) == 1)
-
-            if self.showComplexes:
-                titl = "r = " + str(r)
-                self.show_simplicial_complex(x, y, Pupd.astype(np.double),
-                                            f, rows, cols, j+1, titl)
-            
-        P = numFilt - P
-
-        return P, nTriv, numFilt, C
-
 def bettiCounts(dims, birth_values, death_values, filtValues, dim):
 
     import numpy as np
@@ -1118,8 +900,10 @@ def multi_conn_comp(P, numFilt):
         P2 = (P < i).astype(np.int64)
         P2s = csr_matrix(P2)
         ncc[i-1], ccl = csgraph.connected_components(P2s)
+        #print(ncc, ccl)
         uv, cnts = np.unique(ccl, return_counts = True)
         singly_conn[i-1] = np.sum(cnts == 1)
+        #rint(ncc, singly_conn)
         multi_conn[i-1] = ncc[i-1] - singly_conn[i-1]
 
     return ncc, singly_conn, multi_conn

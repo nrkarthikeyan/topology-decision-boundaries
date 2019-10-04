@@ -13,8 +13,8 @@ Details available at:
    
 **Steps to run the notebook**
 
-- Create a virtual env in Python 2.7 using requirements.txt
-- Install Ripser
+- Create a conda environment (python 3) 
+- Install dependency packages using requirements.txt
 - Compile Cython code
 - Run the notebook
 
@@ -24,8 +24,3 @@ cd src
 
 python setup.py build_ext --inplace
 
-#### External Dependencies ####
-
-https://github.com/Ripser/ripser
-
-Ripser needs to be in the topmost folder
